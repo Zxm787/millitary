@@ -199,19 +199,29 @@ async function removeDuplicateUsers() {
     try {
         const User = mongoose.model('User');
         
-        // البحث عن المستخدمين المكررين
-        const duplicates = await User.aggregate([
+        // البحث عن المستخدمين المكررين باستخدام cursor للكفاءة
+        const cursor = User.aggregate([
             { $group: { _id: "$id", count: { $sum: 1 }, docs: { $push: "$_id" } } },
             { $match: { count: { $gt: 1 } } }
-        ]);
+        ], { allowDiskUse: true }).cursor(); // استخدام cursor مع allowDiskUse: true
         
         let removedCount = 0;
         
-        for (const duplicate of duplicates) {
-            // الاحتفاظ بأول مستخدم وحذف الباقي
-            const toRemove = duplicate.docs.slice(1);
-            await User.deleteMany({ _id: { $in: toRemove } });
-            removedCount += toRemove.length;
+        for (let duplicate = await cursor.next(); duplicate != null; duplicate = await cursor.next()) {
+            try {
+                // الاحتفاظ بأول مستخدم وحذف الباقي
+                const toRemove = duplicate.docs.slice(1);
+                await User.deleteMany({ _id: { $in: toRemove } });
+                removedCount += toRemove.length;
+                
+                // تسجيل التقدم كل 50 عنصر
+                if (removedCount > 0 && removedCount % 50 === 0) {
+                    console.log(`🔄 Removed ${removedCount} duplicate users...`);
+                }
+            } catch (itemError) {
+                console.error(`❌ Error removing duplicate user:`, itemError);
+                // المتابعة مع المستخدم التالي
+            }
         }
         
         console.log(`👥 Removed ${removedCount} duplicate users`);

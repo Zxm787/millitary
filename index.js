@@ -471,7 +471,6 @@ const bad = [ "كس","ام","اختك","امك","مص","زب","زبي","قحبة
 // إنشاء مجموعة لتتبع توقيت آخر أمر لكل مستخدم
 const userCooldowns = new Map();
 const COOLDOWN_TIME = 3000; // 3 ثواني بين كل أمر
-
 // إعدادات نظام الكريدت
 const CREDIT_BOT_ID = '282859044593598464'; // ضع هنا ID بوت الكريدت
 const TRANSFER_RECIPIENT_ID = '790003354667188254'; // ضع هنا ID الشخص الذي يحول له العضو
@@ -517,12 +516,28 @@ async function calculateTotalEconomy() {
                     totalPlayers: { $sum: 1 }
                 }
             }
-        ]);
+        ], { 
+            allowDiskUse: true, // السماح بالكتابة على القرص للبيانات الكبيرة
+            maxTimeMS: 30000 // حد زمني أقصى 30 ثانية
+        });
 
         return result.length > 0 ? result[0] : { totalCoins: 0, totalPlayers: 0 };
     } catch (error) {
         console.error('Error calculating total economy:', error);
-        return { totalCoins: 0, totalPlayers: 0 };
+        // في حالة فشل التجميع، استخدم طريقة بديلة أبسط
+        try {
+            const totalUsers = await User.countDocuments();
+            const sampleUsers = await User.find({}, 'coins').limit(1000);
+            const avgCoins = sampleUsers.length > 0 ? 
+                sampleUsers.reduce((sum, user) => sum + (user.coins || 0), 0) / sampleUsers.length : 0;
+            const estimatedTotalCoins = Math.floor(avgCoins * totalUsers);
+            
+            console.log(`📊 Using estimated economy: ${estimatedTotalCoins} coins for ${totalUsers} players`);
+            return { totalCoins: estimatedTotalCoins, totalPlayers: totalUsers };
+        } catch (fallbackError) {
+            console.error('Error in fallback economy calculation:', fallbackError);
+            return { totalCoins: 0, totalPlayers: 0 };
+        }
     }
 }
 
@@ -856,7 +871,8 @@ async function migrateInventorySystem() {
         console.log('🔄 Starting inventory system migration...');
         
         // البحث عن جميع المستخدمين الذين لديهم عناصر مكررة
-        const duplicateItems = await UserItem.aggregate([
+        // استخدام cursor للتعامل مع البيانات الكبيرة بكفاءة أكبر
+        const cursor = UserItem.aggregate([
             {
                 $group: {
                     _id: { user_id: "$user_id", item_name: "$item_name" },
@@ -867,48 +883,65 @@ async function migrateInventorySystem() {
             {
                 $match: { count: { $gt: 1 } }
             }
-        ]);
+        ], { allowDiskUse: true }).cursor(); // استخدام cursor مع allowDiskUse: true
 
         let migratedCount = 0;
         
-        for (const duplicate of duplicateItems) {
-            const { user_id, item_name } = duplicate._id;
-            const totalQuantity = duplicate.count;
-            
-            // حذف جميع السجلات المكررة
-            await UserItem.deleteMany({ 
-                user_id: user_id, 
-                item_name: item_name 
-            });
-            
-            // إنشاء سجل واحد بالكمية الإجمالية
-            const newItem = new UserItem({
-                user_id: user_id,
-                item_name: item_name,
-                quantity: totalQuantity
-            });
-            await newItem.save();
-            
-            migratedCount++;
+        // معالجة البيانات واحداً تلو الآخر باستخدام cursor
+        for (let duplicate = await cursor.next(); duplicate != null; duplicate = await cursor.next()) {
+            try {
+                const { user_id, item_name } = duplicate._id;
+                const totalQuantity = duplicate.count;
+                
+                // حذف جميع السجلات المكررة
+                await UserItem.deleteMany({ 
+                    user_id: user_id, 
+                    item_name: item_name 
+                });
+                
+                // إنشاء سجل واحد بالكمية الإجمالية
+                const newItem = new UserItem({
+                    user_id: user_id,
+                    item_name: item_name,
+                    quantity: totalQuantity
+                });
+                await newItem.save();
+                
+                migratedCount++;
+                
+                // تسجيل التقدم كل 100 عنصر
+                if (migratedCount % 100 === 0) {
+                    console.log(`🔄 Processed ${migratedCount} duplicate groups...`);
+                }
+                
+                // إضافة تأخير قصير كل 50 عنصر لتقليل الضغط على قاعدة البيانات
+                if (migratedCount % 50 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            } catch (itemError) {
+                console.error(`❌ Error processing duplicate item:`, itemError);
+                // المتابعة مع العنصر التالي بدلاً من إيقاف العملية كاملة
+            }
         }
         
         // تحديث العناصر الموجودة التي لا تحتوي على quantity
-        const itemsWithoutQuantity = await UserItem.find({ 
-            $or: [
-                { quantity: { $exists: false } },
-                { quantity: null },
-                { quantity: 0 }
-            ]
-        });
+        // استخدام updateMany لتحديث أسرع وأكثر كفاءة
+        const updateResult = await UserItem.updateMany(
+            {
+                $or: [
+                    { quantity: { $exists: false } },
+                    { quantity: null },
+                    { quantity: 0 }
+                ]
+            },
+            { $set: { quantity: 1 } }
+        );
         
-        for (const item of itemsWithoutQuantity) {
-            item.quantity = 1;
-            await item.save();
-        }
+        const updatedCount = updateResult.modifiedCount;
         
-        console.log(`✅ Migration completed! Processed ${migratedCount} duplicate groups and ${itemsWithoutQuantity.length} items without quantity.`);
+        console.log(`✅ Migration completed! Processed ${migratedCount} duplicate groups and ${updatedCount} items without quantity.`);
         
-        return { migratedCount, updatedCount: itemsWithoutQuantity.length };
+        return { migratedCount, updatedCount };
         
     } catch (error) {
         console.error('❌ Error during migration:', error);
@@ -952,7 +985,6 @@ function startSalarySystem() {
         }
     }, 60000); // كل دقيقة للتحقق
 }
-
 // دالة حساب إجمالي الضرر
 function calculateTotalDamage(user, attackingCount) {
     if (!user) return 0;
@@ -1449,7 +1481,6 @@ process.on('SIGINT', () => {
     client.destroy();
     process.exit(0);
 });
-
 // مراقبة استخدام الذاكرة
 setInterval(() => {
     const memUsage = process.memoryUsage();
@@ -6042,7 +6073,6 @@ if (message.content.startsWith('!توب')) {
             totalHealth += (troops.lowMoraleSoldiers || 0) * 15; // جنود ضعيفي الهمة: 15 صحة
             return totalHealth;
         }
-
         // دالة حساب الضرر المتوقع للقوات المرسلة
         function calculateAttackingForceDamage(attacker, attackingCount) {
             let damage = 0;
@@ -6370,7 +6400,6 @@ if (message.content.startsWith('!توب')) {
                         }
                     });
                 };
-
                 // دالة بدء المعركة
                 const startBattle = async () => {
                     try {
@@ -6688,7 +6717,6 @@ if (message.content.startsWith('!توب')) {
 
                             await message.channel.send({ embeds: [retreatEmbed] });
                         };
-
                         // دالة إنهاء المعركة
                         const endBattle = async () => {
                             const attackerAlive = Object.values(battleAttacker).some(count => count > 0);
