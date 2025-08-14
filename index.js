@@ -467,7 +467,6 @@ async function updateInviteCache(guild) {
         console.error('Error updating invite cache:', error);
     }
 }
-
 const bad = [ "كس","ام","اختك","امك","مص","زب","زبي","قحبة","قحبه","كحبه", ];
 // إنشاء مجموعة لتتبع توقيت آخر أمر لكل مستخدم
 const userCooldowns = new Map();
@@ -772,7 +771,8 @@ const userSchema = new mongoose.Schema({
 
 const itemSchema = new mongoose.Schema({
     user_id: String,
-    item_name: String
+    item_name: String,
+    quantity: { type: Number, default: 1 }
 });
 
 const allianceSchema = new mongoose.Schema({
@@ -808,11 +808,125 @@ const Alliance = mongoose.model('Alliance', allianceSchema);
 const AllianceRequest = mongoose.model('AllianceRequest', allianceRequestSchema);
 const Ticket = mongoose.model('Ticket', ticketSchema);
 
-mongoose.connection.once('open', () => {
+// دوال مساعدة للتعامل مع النظام الجديد للعناصر
+async function addUserItem(userId, itemName, quantity = 1) {
+    const existingItem = await UserItem.findOne({ user_id: userId, item_name: itemName });
+    if (existingItem) {
+        existingItem.quantity += quantity;
+        await existingItem.save();
+    } else {
+        const newItem = new UserItem({ user_id: userId, item_name: itemName, quantity });
+        await newItem.save();
+    }
+}
+
+async function removeUserItem(userId, itemName, quantity = 1) {
+    const existingItem = await UserItem.findOne({ user_id: userId, item_name: itemName });
+    if (existingItem) {
+        if (existingItem.quantity <= quantity) {
+            await UserItem.deleteOne({ _id: existingItem._id });
+        } else {
+            existingItem.quantity -= quantity;
+            await existingItem.save();
+        }
+        return true;
+    }
+    return false;
+}
+
+async function getUserItemCount(userId, itemName) {
+    const item = await UserItem.findOne({ user_id: userId, item_name: itemName });
+    return item ? item.quantity : 0;
+}
+
+async function hasUserItem(userId, itemName) {
+    const count = await getUserItemCount(userId, itemName);
+    return count > 0;
+}
+
+// حدود العناصر
+const ITEM_LIMITS = {
+    'المنجم': 100,
+    'مستخرج النفط': 100
+};
+
+// دالة تحويل البيانات من النظام القديم إلى الجديد
+async function migrateInventorySystem() {
+    try {
+        console.log('🔄 Starting inventory system migration...');
+        
+        // البحث عن جميع المستخدمين الذين لديهم عناصر مكررة
+        const duplicateItems = await UserItem.aggregate([
+            {
+                $group: {
+                    _id: { user_id: "$user_id", item_name: "$item_name" },
+                    count: { $sum: 1 },
+                    items: { $push: "$_id" }
+                }
+            },
+            {
+                $match: { count: { $gt: 1 } }
+            }
+        ]);
+
+        let migratedCount = 0;
+        
+        for (const duplicate of duplicateItems) {
+            const { user_id, item_name } = duplicate._id;
+            const totalQuantity = duplicate.count;
+            
+            // حذف جميع السجلات المكررة
+            await UserItem.deleteMany({ 
+                user_id: user_id, 
+                item_name: item_name 
+            });
+            
+            // إنشاء سجل واحد بالكمية الإجمالية
+            const newItem = new UserItem({
+                user_id: user_id,
+                item_name: item_name,
+                quantity: totalQuantity
+            });
+            await newItem.save();
+            
+            migratedCount++;
+        }
+        
+        // تحديث العناصر الموجودة التي لا تحتوي على quantity
+        const itemsWithoutQuantity = await UserItem.find({ 
+            $or: [
+                { quantity: { $exists: false } },
+                { quantity: null },
+                { quantity: 0 }
+            ]
+        });
+        
+        for (const item of itemsWithoutQuantity) {
+            item.quantity = 1;
+            await item.save();
+        }
+        
+        console.log(`✅ Migration completed! Processed ${migratedCount} duplicate groups and ${itemsWithoutQuantity.length} items without quantity.`);
+        
+        return { migratedCount, updatedCount: itemsWithoutQuantity.length };
+        
+    } catch (error) {
+        console.error('❌ Error during migration:', error);
+        return { error: error.message };
+    }
+}
+
+mongoose.connection.once('open', async () => {
     console.log('Connected to MongoDB');
 
     // بدء نظام الرواتب التلقائي
     startSalarySystem();
+    
+    // تشغيل التحويل التلقائي للنظام الجديد بعد 15 ثانية
+    setTimeout(async () => {
+        console.log('🔄 Starting automatic inventory migration...');
+        await migrateInventorySystem();
+    }, 15000);
 });
 
 // نظام الرواتب التلقائي
@@ -925,7 +1039,6 @@ function calculateDefenderLosses(defender, totalDamage) {
 
     return losses.soldiers + losses.officers + losses.colonels + losses.generals + losses.lowMoraleSoldiers;
 }
-
 async function processUserSalary(user) {
     try {
         const now = new Date();
@@ -1396,7 +1509,6 @@ setInterval(() => {
         console.log('🔄 Error statistics reset');
     }
 }, 600000); // كل 10 دقائق
-
 // معالج التفاعلات (الأزرار)
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
@@ -1788,7 +1900,6 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 });
-
 // معالج النماذج (Modals)
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isModalSubmit()) return;
@@ -2755,7 +2866,7 @@ if (message.content === '!تصفير_الكل') {
 
     try {
         // التحقق من أن الرسالة تبدأ بأمر
-        const commands = ['!اضافة_عملات', '!تصفير', '!توب', '!البدء', '!غارة', '!هجوم', '!p', '!شراء', '!مخزون', '!قصف', '!تدريب', '!تحالف', '!انضمام', '!قبول', '!رفض', '!الطلبات', '!طرد', '!ترقية', '!تخفيض', '!اعطاء', '!حرب', '!سلام', '!مقبول', '!التحالفات', '!العلاقات', '!الاعضاء', '!خروج', '!حذف', '!ازالة', '!ازالة_الكل', '!راتب', '!تسريح', '!جمع', '!تذكرة', '!del', '!اجمالي', '!rem', '!الاقتصاد', '!شرح'];
+        const commands = ['!اضافة_عملات', '!تصفير', '!توب', '!البدء', '!غارة', '!هجوم', '!p', '!شراء', '!مخزون', '!قصف', '!تدريب', '!تحالف', '!انضمام', '!قبول', '!رفض', '!الطلبات', '!طرد', '!ترقية', '!تخفيض', '!اعطاء', '!حرب', '!سلام', '!مقبول', '!التحالفات', '!العلاقات', '!الاعضاء', '!خروج', '!حذف', '!ازالة', '!ازالة_الكل', '!راتب', '!تسريح', '!جمع', '!تذكرة', '!del', '!اجمالي', '!rem', '!الاقتصاد', '!شرح', '!تحويل_المخزون'];
         const isCommand = commands.some(cmd => message.content.startsWith(cmd));
 
         if (!isCommand) return;
@@ -3232,7 +3343,6 @@ if (message.content === '!تصفير_الكل') {
                 message.reply('حدث خطأ أثناء تنفيذ الأمر. يرجى المحاولة مرة أخرى.');
             }
         }
-
         // أمر ترقية عضو
         if (message.content.startsWith('!ترقية')) {
             try {
@@ -3387,22 +3497,15 @@ if (message.content === '!تصفير_الكل') {
 
                 } else {
                     // التحقق من العناصر الأخرى
-                    const userItems = await UserItem.find({ user_id: message.author.id, item_name: resourceType });
+                    const currentCount = await getUserItemCount(message.author.id, resourceType);
 
-                    if (userItems.length < amount) {
+                    if (currentCount < amount) {
                         return message.reply(`ليس لديك ${amount} من ${resourceType} لإعطائها.`);
                     }
 
-                    // حذف العناصر من المعطي
-                    const itemsToRemove = userItems.slice(0, amount);
-                    await UserItem.deleteMany({ _id: { $in: itemsToRemove.map(item => item._id) } });
-
-                    // إضافة العناصر للمتلقي
-                    const itemsToAdd = [];
-                    for (let i = 0; i < amount; i++) {
-                        itemsToAdd.push({ user_id: targetUser.id, item_name: resourceType });
-                    }
-                    await UserItem.insertMany(itemsToAdd);
+                    // إزالة العناصر من المعطي وإضافتها للمتلقي
+                    await removeUserItem(message.author.id, resourceType, amount);
+                    await addUserItem(targetUser.id, resourceType, amount);
 
                     message.reply(`تم إعطاء ${amount} من ${resourceType} إلى ${targetUser.username} بنجاح!`);
                 }
@@ -3698,7 +3801,6 @@ if (message.content === '!تصفير_الكل') {
                 console.error('❌ خطأ في فحص حالة قائد التحالف:', error);
             }
         }
-
         // أمر قبول السلام - تم تغييره إلى !مقبول
         if (message.content.startsWith('!مقبول')) {
             try {
@@ -4121,15 +4223,13 @@ if (message.content === '!تصفير_الكل') {
                 message.reply('حدث خطأ أثناء تنفيذ الأمر. يرجى المحاولة مرة أخرى.');
             }
         }
-
         // أمر تدريب الجنود
         if (message.content.startsWith('!تدريب')) {
             try {
                 const user = await User.findOne({ id: message.author.id });
                 if (!user) return message.reply('لم تقم بإنشاء جيش بعد. استخدم !البدء لإنشاء جيش.');
 
-                const userItems = await UserItem.find({ user_id: message.author.id });
-                const hasTrainingCamp = userItems.some(item => item.item_name === 'معسكر التدريب');
+                const hasTrainingCamp = await hasUserItem(message.author.id, 'معسكر التدريب');
 
                 if (!hasTrainingCamp) {
                     return message.reply('تحتاج إلى معسكر التدريب لتدريب الجنود. يمكن شراؤه من قائمة الشراء.');
@@ -4489,9 +4589,8 @@ if (message.content === '!تصفير_الكل') {
                 const user = await User.findOne({ id: message.author.id });
                 if (!user) return message.reply('لم تقم بإنشاء جيش بعد. استخدم !البدء لإنشاء جيش.');
 
-                const userItems = await UserItem.find({ user_id: message.author.id });
-                const mineCount = userItems.filter(item => item.item_name === 'المنجم').length;
-                const oilExtractorCount = userItems.filter(item => item.item_name === 'مستخرج النفط').length;
+                const mineCount = await getUserItemCount(message.author.id, 'المنجم');
+                const oilExtractorCount = await getUserItemCount(message.author.id, 'مستخرج النفط');
 
                 if (mineCount === 0 && oilExtractorCount === 0) {
                     return message.reply('لا تملك أي مناجم أو مستخرجات نفط لجمع الدخل منها.');
@@ -4587,7 +4686,6 @@ if (message.content === '!تصفير_الكل') {
                 message.reply('حدث خطأ أثناء تنفيذ الأمر. يرجى المحاولة مرة أخرى.');
             }
         }
-
         // أمر تسريح الجنود
         if (message.content.startsWith('!تسريح')) {
             try {
@@ -5084,7 +5182,6 @@ if (message.content === '!تصفير_الكل') {
                 message.reply('❌ حدث خطأ أثناء جلب إحصائيات قاعدة البيانات.');
             }
         }
-
         // أمر عرض العلاقات والتحالفات المحاربة
         if (message.content.startsWith('!العلاقات')) {
             try {
@@ -5431,6 +5528,39 @@ if (message.content === '!تصفير_الكل') {
             } catch (error) {
                 console.error('Error in !اضافة_عملات command:', error);
                 message.reply('حدث خطأ أثناء تنفيذ الأمر. يرجى المحاولة مرة أخرى.');
+            }
+        }
+
+        // أمر تحويل نظام المخزون (للمشرفين فقط)
+        if (message.content.startsWith('!تحويل_المخزون')) {
+            try {
+                if (!message.member.permissions.has('Administrator')) {
+                    return message.reply('عذراً، ليس لديك صلاحية لاستخدام هذا الأمر.');
+                }
+
+                message.reply('🔄 بدء تحويل نظام المخزون...');
+                
+                const result = await migrateInventorySystem();
+                
+                if (result.error) {
+                    message.reply(`❌ حدث خطأ أثناء التحويل: ${result.error}`);
+                } else {
+                    const embed = new discord.EmbedBuilder()
+                        .setColor('#00FF00')
+                        .setTitle('✅ تم تحويل نظام المخزون بنجاح')
+                        .addFields(
+                            { name: '📦 المجموعات المحولة', value: `${result.migratedCount}`, inline: true },
+                            { name: '🔧 العناصر المحدثة', value: `${result.updatedCount}`, inline: true }
+                        )
+                        .setDescription('تم تحويل جميع العناصر المكررة إلى نظام الكمية الجديد.\n\n**الفوائد:**\n• تقليل استخدام قاعدة البيانات بشكل كبير\n• أداء أسرع للبوت\n• حد أقصى 100 منجم و 100 مستخرج نفط لكل لاعب')
+                        .setTimestamp();
+
+                    message.reply({ embeds: [embed] });
+                }
+                
+            } catch (error) {
+                console.error('Error in migration command:', error);
+                message.reply('❌ حدث خطأ أثناء تنفيذ التحويل.');
             }
         }
         // أمر لتصفير جنود اللاعب وممتلكاته وجيشه، يمكن استخدامه فقط من قبل المستخدمين الذين لديهم صلاحيات Administrator
@@ -6048,7 +6178,6 @@ if (message.content.startsWith('!توب')) {
             operationTimeout: 5000,
             cleanupInterval: 60000
         };
-
         // إضافة مراقب الأداء
         const performanceMonitor = {
             operations: new Map(),
@@ -6135,8 +6264,7 @@ if (message.content.startsWith('!توب')) {
                     }
                 }
 
-                const opponentItems = await UserItem.find({ user_id: opponent.id });
-                const hasWall = opponentItems.some(item => item.item_name === 'أسوار');
+                const hasWall = await hasUserItem(opponent.id, 'أسوار');
 
                 if (hasWall) {
                     return message.reply(`${opponent.username} لديه سور! لا يمكنك الهجوم عليه بالجنود. استخدم !قصف لتدمير السور.`);
@@ -6528,7 +6656,6 @@ if (message.content.startsWith('!توب')) {
                                 setTimeout(() => endBattle(), 2000);
                             }
                         };
-
                         // دالة إنهاء المعركة بالانسحاب
                         const endBattleWithRetreat = async () => {
                             // تحديث قاعدة البيانات
@@ -6726,11 +6853,7 @@ if (message.content.startsWith('!توب')) {
                                 // نقل الممتلكات
                                 const opponentItems = await UserItem.find({ user_id: opponent.id });
                                 for (const item of opponentItems) {
-                                    const newItem = new UserItem({
-                                        user_id: attacker.id,
-                                        item_name: item.item_name
-                                    });
-                                    await newItem.save();
+                                    await addUserItem(attacker.id, item.item_name, item.quantity);
                                 }
 
                                 resultEmbed = new discord.EmbedBuilder()
@@ -6859,8 +6982,8 @@ if (message.content.startsWith('!توب')) {
                 const minutesLeftSalary = Math.floor(timeUntilNextSalary / (60 * 1000));
 
                 // حساب المناجم ومستخرجات النفط
-                const mineCount = userItems.filter(item => item.item_name === 'المنجم').length;
-                const oilExtractorCount = userItems.filter(item => item.item_name === 'مستخرج النفط').length;
+                const mineCount = await getUserItemCount(user.id, 'المنجم');
+                const oilExtractorCount = await getUserItemCount(user.id, 'مستخرج النفط');
 
                 const embed = new discord.EmbedBuilder()
                     .setColor('#1E90FF')
@@ -6960,12 +7083,12 @@ if (message.content.startsWith('!توب')) {
                 const missiles = userItems.filter(item => item.item_name.startsWith('صاروخ'));
                 const missileCounts = {};
                 missiles.forEach(missile => {
-                    missileCounts[missile.item_name] = (missileCounts[missile.item_name] || 0) + 1;
+                    missileCounts[missile.item_name] = missile.quantity;
                 });
 
-                const ammoCount = userItems.filter(item => item.item_name === 'رصاص دفاع جوي').length;
-                const hasAirDefense = userItemNames.includes('نظام الدفاع الجوي');
-                const hasWalls = userItemNames.includes('أسوار');
+                const ammoCount = await getUserItemCount(user.id, 'رصاص دفاع جوي');
+                const hasAirDefense = await hasUserItem(user.id, 'نظام الدفاع الجوي');
+                const hasWalls = await hasUserItem(user.id, 'أسوار');
 
                 if (Object.keys(missileCounts).length > 0 || ammoCount > 0 || hasAirDefense || hasWalls) {
                     let defenseInfo = '';
@@ -7030,7 +7153,6 @@ if (message.content.startsWith('!توب')) {
                     embeds: [embed], 
                     components: components 
                 });
-
                 // معالج الأزرار (للملف الشخصي فقط)
                 if (isOwnProfile && components.length > 0) {
                     const filter = i => i.user.id === message.author.id;
@@ -7045,9 +7167,8 @@ if (message.content.startsWith('!توب')) {
                                 // تنفيذ أمر جمع الدخل
                                 const currentTime = new Date();
                                 const updatedUser = await User.findOne({ id: user.id });
-                                const updatedUserItems = await UserItem.find({ user_id: user.id });
-                                const updatedMineCount = updatedUserItems.filter(item => item.item_name === 'المنجم').length;
-                                const updatedOilCount = updatedUserItems.filter(item => item.item_name === 'مستخرج النفط').length;
+                                const updatedMineCount = await getUserItemCount(user.id, 'المنجم');
+                                const updatedOilCount = await getUserItemCount(user.id, 'مستخرج النفط');
 
                                 let totalIncome = 0;
                                 let incomeDetails = '';
@@ -7121,10 +7242,10 @@ if (message.content.startsWith('!توب')) {
                                 const missiles = updatedUserItems.filter(item => item.item_name.startsWith('صاروخ'));
                                 const missileCounts = {};
                                 missiles.forEach(missile => {
-                                    missileCounts[missile.item_name] = (missileCounts[missile.item_name] || 0) + 1;
+                                    missileCounts[missile.item_name] = missile.quantity;
                                 });
 
-                                const ammoCount = updatedUserItems.filter(item => item.item_name === 'رصاص دفاع جوي').length;
+                                const ammoCount = await getUserItemCount(i.user.id, 'رصاص دفاع جوي');
 
                                 const inventoryEmbed = new discord.EmbedBuilder()
                                     .setColor('#00FF00')
@@ -7229,8 +7350,8 @@ if (message.content.startsWith('!شراء')) {
         const userItemNames = userItems.map(item => item.item_name);
 
         // حساب عدد المناجم ومستخرجات النفط
-        const mineCount = userItems.filter(item => item.item_name === 'المنجم').length;
-        const oilExtractorCount = userItems.filter(item => item.item_name === 'مستخرج النفط').length;
+        const mineCount = await getUserItemCount(message.author.id, 'المنجم');
+        const oilExtractorCount = await getUserItemCount(message.author.id, 'مستخرج النفط');
 
         const itemsToHideIfOwned = ['قاعدة', 'قاعدة الصواريخ', 'نظام الدفاع الجوي', 'أسوار', 'معسكر التدريب'];
 
@@ -7302,11 +7423,19 @@ if (message.content.startsWith('!شراء')) {
                                     if (selectedItem.name === 'جندي') {
                                         user.soldiers += quantity;
                                     } else {
-                                        const itemsToAdd = [];
-                                        for (let i = 0; i < quantity; i++) {
-                                            itemsToAdd.push({ user_id: message.author.id, item_name: selectedItem.name });
+                                        // التحقق من الحدود للمناجم ومستخرجات النفط
+                                        if (ITEM_LIMITS[selectedItem.name]) {
+                                            const currentCount = await getUserItemCount(message.author.id, selectedItem.name);
+                                            if (currentCount + quantity > ITEM_LIMITS[selectedItem.name]) {
+                                                const maxCanBuy = ITEM_LIMITS[selectedItem.name] - currentCount;
+                                                if (maxCanBuy <= 0) {
+                                                    return i.reply(`لا يمكنك شراء المزيد من ${selectedItem.name}. الحد الأقصى هو ${ITEM_LIMITS[selectedItem.name]}.`);
+                                                }
+                                                return i.reply(`يمكنك شراء ${maxCanBuy} فقط من ${selectedItem.name} (الحد الأقصى ${ITEM_LIMITS[selectedItem.name]}).`);
+                                            }
                                         }
-                                        await UserItem.insertMany(itemsToAdd); // إضافة العناصر بشكل فوري
+                                        
+                                        await addUserItem(message.author.id, selectedItem.name, quantity);
                                     }
 
                                     user.coins -= totalCost;
@@ -7329,10 +7458,17 @@ if (message.content.startsWith('!شراء')) {
                             return message.reply(`ليس لديك ما يكفي من العملات لشراء ${selectedItem.name}. تحتاج إلى ${selectedItem.price} عملة.`);
                         }
 
+                        // التحقق من الحدود للمناجم ومستخرجات النفط
+                        if (ITEM_LIMITS[selectedItem.name]) {
+                            const currentCount = await getUserItemCount(message.author.id, selectedItem.name);
+                            if (currentCount >= ITEM_LIMITS[selectedItem.name]) {
+                                return message.reply(`لا يمكنك شراء المزيد من ${selectedItem.name}. الحد الأقصى هو ${ITEM_LIMITS[selectedItem.name]}.`);
+                            }
+                        }
+
                         user.coins -= selectedItem.price;
                         await user.save();
-                        const newItem = new UserItem({ user_id: message.author.id, item_name: selectedItem.name });
-                        await newItem.save();
+                        await addUserItem(message.author.id, selectedItem.name, 1);
                         message.reply(`تم شراء ${selectedItem.name} بنجاح!`);
                     }
                 } catch (error) {
@@ -7361,14 +7497,10 @@ if (message.content.startsWith('!شراء')) {
                     const missiles = userItems.filter(item => item.item_name.startsWith('صاروخ'));
                     const missileCounts = {};
                     missiles.forEach(missile => {
-                        if (!missileCounts[missile.item_name]) {
-                            missileCounts[missile.item_name] = 1;
-                        } else {
-                            missileCounts[missile.item_name]++;
-                        }
+                        missileCounts[missile.item_name] = missile.quantity;
                     });
 
-                    const ammoCount = userItems.filter(item => item.item_name === 'رصاص دفاع جوي').length;
+                    const ammoCount = await getUserItemCount(message.author.id, 'رصاص دفاع جوي');
 
                     const embed = new discord.EmbedBuilder()
                         .setColor('#00FF00')
@@ -7418,14 +7550,14 @@ if (message.content.startsWith('!قصف')) {
         }
 
         const attackerItems = await UserItem.find({ user_id: message.author.id });
-        const attackerMissiles = attackerItems.filter(item => item.item_name.startsWith('صاروخ'));
+        const attackerMissiles = attackerItems.filter(item => item.item_name.startsWith('صاروخ') && item.quantity > 0);
 
         if (attackerMissiles.length === 0) {
             return message.reply('لا تمتلك أي صواريخ للهجوم!');
         }
 
         const missileCounts = attackerMissiles.reduce((acc, item) => {
-            acc[item.item_name] = (acc[item.item_name] || 0) + 1;
+            acc[item.item_name] = (acc[item.item_name] || 0) + item.quantity;
             return acc;
         }, {});
 
@@ -7838,7 +7970,6 @@ if (message.content.startsWith('!قصف')) {
                 message.reply('حدث خطأ أثناء جلب إحصائيات نظام المكافآت.');
             }
         }
-
         // أمر مسح قائمة الأعضاء الذين غادروا (للمشرفين فقط)
         if (message.content.startsWith('!مسح_المغادرين')) {
             try {
