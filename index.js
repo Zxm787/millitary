@@ -865,62 +865,179 @@ const ITEM_LIMITS = {
     'مستخرج النفط': 100
 };
 
+// دالة بديلة لمعالجة المخزون بدون aggregation
+async function migrateInventorySystemSimple() {
+    try {
+        console.log('🔄 Starting simple inventory system migration...');
+        
+        let migratedCount = 0;
+        let updatedCount = 0;
+        
+        // الحصول على جميع أسماء العناصر الفريدة
+        const distinctItems = await UserItem.distinct('item_name');
+        console.log(`📦 Found ${distinctItems.length} distinct item types`);
+        
+        for (const itemName of distinctItems) {
+            try {
+                // الحصول على جميع المستخدمين الذين لديهم هذا العنصر
+                const distinctUsers = await UserItem.distinct('user_id', { item_name: itemName });
+                
+                for (const userId of distinctUsers) {
+                    try {
+                        // البحث عن جميع سجلات هذا المستخدم لهذا العنصر
+                        const userItems = await UserItem.find({ user_id: userId, item_name: itemName });
+                        
+                        if (userItems.length > 1) {
+                            // حساب الكمية الإجمالية
+                            const totalQuantity = userItems.reduce((sum, item) => sum + (item.quantity || 1), 0);
+                            
+                            // حذف جميع السجلات
+                            await UserItem.deleteMany({ user_id: userId, item_name: itemName });
+                            
+                            // إنشاء سجل واحد جديد
+                            const newItem = new UserItem({
+                                user_id: userId,
+                                item_name: itemName,
+                                quantity: totalQuantity
+                            });
+                            await newItem.save();
+                            
+                            migratedCount++;
+                            
+                            if (migratedCount % 20 === 0) {
+                                console.log(`🔄 Processed ${migratedCount} duplicate groups...`);
+                            }
+                        } else if (userItems.length === 1 && (!userItems[0].quantity || userItems[0].quantity === 0)) {
+                            // تحديث العناصر بدون quantity
+                            await UserItem.updateOne(
+                                { _id: userItems[0]._id },
+                                { $set: { quantity: 1 } }
+                            );
+                            updatedCount++;
+                        }
+                        
+                        // تأخير قصير كل 10 مستخدمين
+                        if ((migratedCount + updatedCount) % 10 === 0) {
+                            await new Promise(resolve => setTimeout(resolve, 50));
+                        }
+                        
+                    } catch (userError) {
+                        console.error(`❌ Error processing user ${userId} for item ${itemName}:`, userError);
+                    }
+                }
+                
+                // تأخير بين العناصر المختلفة
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+            } catch (itemError) {
+                console.error(`❌ Error processing item ${itemName}:`, itemError);
+            }
+        }
+        
+        console.log(`✅ Simple migration completed! Processed ${migratedCount} duplicate groups and ${updatedCount} items without quantity.`);
+        return { migratedCount, updatedCount, simple: true };
+        
+    } catch (error) {
+        console.error('❌ Error during simple migration:', error);
+        return { error: error.message };
+    }
+}
+
 // دالة تحويل البيانات من النظام القديم إلى الجديد
 async function migrateInventorySystem() {
     try {
         console.log('🔄 Starting inventory system migration...');
         
         // البحث عن جميع المستخدمين الذين لديهم عناصر مكررة
-        // استخدام cursor للتعامل مع البيانات الكبيرة بكفاءة أكبر
-        const cursor = UserItem.aggregate([
-            {
-                $group: {
-                    _id: { user_id: "$user_id", item_name: "$item_name" },
-                    count: { $sum: 1 },
-                    items: { $push: "$_id" }
-                }
-            },
-            {
-                $match: { count: { $gt: 1 } }
-            }
-        ], { allowDiskUse: true }).cursor(); // استخدام cursor مع allowDiskUse: true
-
+        // استخدام مراحل متعددة وتحسين الذاكرة
         let migratedCount = 0;
+        let batchSize = 100; // معالجة 100 مجموعة في كل مرة
+        let skip = 0;
+        let hasMoreData = true;
         
-        // معالجة البيانات واحداً تلو الآخر باستخدام cursor
-        for (let duplicate = await cursor.next(); duplicate != null; duplicate = await cursor.next()) {
+        while (hasMoreData) {
             try {
-                const { user_id, item_name } = duplicate._id;
-                const totalQuantity = duplicate.count;
-                
-                // حذف جميع السجلات المكررة
-                await UserItem.deleteMany({ 
-                    user_id: user_id, 
-                    item_name: item_name 
+                // معالجة البيانات على دفعات صغيرة لتجنب مشاكل الذاكرة
+                const duplicates = await UserItem.aggregate([
+                    {
+                        $group: {
+                            _id: { user_id: "$user_id", item_name: "$item_name" },
+                            count: { $sum: 1 },
+                            items: { $push: "$_id" }
+                        }
+                    },
+                    {
+                        $match: { count: { $gt: 1 } }
+                    },
+                    {
+                        $skip: skip
+                    },
+                    {
+                        $limit: batchSize
+                    }
+                ], { 
+                    allowDiskUse: true,
+                    maxTimeMS: 60000, // 60 ثانية كحد أقصى
+                    cursor: { batchSize: 50 } // حجم دفعة أصغر للcursor
                 });
                 
-                // إنشاء سجل واحد بالكمية الإجمالية
-                const newItem = new UserItem({
-                    user_id: user_id,
-                    item_name: item_name,
-                    quantity: totalQuantity
-                });
-                await newItem.save();
-                
-                migratedCount++;
-                
-                // تسجيل التقدم كل 100 عنصر
-                if (migratedCount % 100 === 0) {
-                    console.log(`🔄 Processed ${migratedCount} duplicate groups...`);
+                if (duplicates.length === 0) {
+                    hasMoreData = false;
+                    break;
                 }
                 
-                // إضافة تأخير قصير كل 50 عنصر لتقليل الضغط على قاعدة البيانات
-                if (migratedCount % 50 === 0) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
+                // معالجة كل دفعة
+                for (const duplicate of duplicates) {
+                    try {
+                        const { user_id, item_name } = duplicate._id;
+                        const totalQuantity = duplicate.count;
+                        
+                        // حذف جميع السجلات المكررة
+                        await UserItem.deleteMany({ 
+                            user_id: user_id, 
+                            item_name: item_name 
+                        });
+                        
+                        // إنشاء سجل واحد بالكمية الإجمالية
+                        const newItem = new UserItem({
+                            user_id: user_id,
+                            item_name: item_name,
+                            quantity: totalQuantity
+                        });
+                        await newItem.save();
+                        
+                        migratedCount++;
+                        
+                        // تسجيل التقدم كل 50 عنصر
+                        if (migratedCount % 50 === 0) {
+                            console.log(`🔄 Processed ${migratedCount} duplicate groups...`);
+                        }
+                        
+                    } catch (itemError) {
+                        console.error(`❌ Error processing duplicate item:`, itemError);
+                        // المتابعة مع العنصر التالي بدلاً من إيقاف العملية كاملة
+                    }
                 }
-            } catch (itemError) {
-                console.error(`❌ Error processing duplicate item:`, itemError);
-                // المتابعة مع العنصر التالي بدلاً من إيقاف العملية كاملة
+                
+                skip += batchSize;
+                
+                // تأخير قصير بين الدفعات لتقليل الضغط
+                await new Promise(resolve => setTimeout(resolve, 200));
+                
+            } catch (batchError) {
+                console.error(`❌ Error processing batch starting at ${skip}:`, batchError);
+                
+                // في حالة فشل الدفعة، جرب الطريقة البسيطة بدون aggregation
+                console.log('🔄 Switching to simple migration method...');
+                try {
+                    const simpleResult = await migrateInventorySystemSimple();
+                    return simpleResult;
+                } catch (alternativeError) {
+                    console.error(`❌ Simple method also failed:`, alternativeError);
+                    hasMoreData = false;
+                }
+                
+                skip += batchSize;
             }
         }
         
@@ -945,7 +1062,30 @@ async function migrateInventorySystem() {
         
     } catch (error) {
         console.error('❌ Error during migration:', error);
-        return { error: error.message };
+        
+        // طريقة احتياطية في حالة فشل كل شيء
+        try {
+            console.log('🔄 Attempting emergency fallback method...');
+            
+            // معالجة بسيطة جداً: تحديث العناصر بدون quantity فقط
+            const emergencyUpdate = await UserItem.updateMany(
+                {
+                    $or: [
+                        { quantity: { $exists: false } },
+                        { quantity: null },
+                        { quantity: 0 }
+                    ]
+                },
+                { $set: { quantity: 1 } }
+            );
+            
+            console.log(`⚠️ Emergency fallback completed. Updated ${emergencyUpdate.modifiedCount} items.`);
+            return { migratedCount: 0, updatedCount: emergencyUpdate.modifiedCount, emergency: true };
+            
+        } catch (emergencyError) {
+            console.error('❌ Emergency fallback also failed:', emergencyError);
+            return { error: error.message };
+        }
     }
 }
 
@@ -5577,13 +5717,23 @@ if (message.content === '!تصفير_الكل') {
                     message.reply(`❌ حدث خطأ أثناء التحويل: ${result.error}`);
                 } else {
                     const embed = new discord.EmbedBuilder()
-                        .setColor('#00FF00')
-                        .setTitle('✅ تم تحويل نظام المخزون بنجاح')
+                        .setColor(result.emergency ? '#FFA500' : '#00FF00')
+                        .setTitle(
+                            result.emergency ? '⚠️ تم تحويل نظام المخزون بالوضع الطارئ' : 
+                            result.simple ? '✅ تم تحويل نظام المخزون بالطريقة البسيطة' :
+                            '✅ تم تحويل نظام المخزون بنجاح'
+                        )
                         .addFields(
                             { name: '📦 المجموعات المحولة', value: `${result.migratedCount}`, inline: true },
                             { name: '🔧 العناصر المحدثة', value: `${result.updatedCount}`, inline: true }
                         )
-                        .setDescription('تم تحويل جميع العناصر المكررة إلى نظام الكمية الجديد.\n\n**الفوائد:**\n• تقليل استخدام قاعدة البيانات بشكل كبير\n• أداء أسرع للبوت\n• حد أقصى 100 منجم و 100 مستخرج نفط لكل لاعب')
+                        .setDescription(
+                            result.emergency ? 
+                                'تم استخدام الوضع الطارئ لتحديث العناصر. تم تحديث العناصر بدون كمية محددة فقط.\n\n**ملاحظة:** قد تحتاج لتشغيل الأمر مرة أخرى في وقت لاحق لمعالجة العناصر المكررة.' :
+                            result.simple ?
+                                'تم تحويل المخزون باستخدام الطريقة البسيطة (بدون aggregation) لتجنب مشاكل الذاكرة.\n\n**الفوائد:**\n• تقليل استخدام قاعدة البيانات بشكل كبير\n• أداء أسرع للبوت\n• حد أقصى 100 منجم و 100 مستخرج نفط لكل لاعب' :
+                                'تم تحويل جميع العناصر المكررة إلى نظام الكمية الجديد.\n\n**الفوائد:**\n• تقليل استخدام قاعدة البيانات بشكل كبير\n• أداء أسرع للبوت\n• حد أقصى 100 منجم و 100 مستخرج نفط لكل لاعب'
+                        )
                         .setTimestamp();
 
                     message.reply({ embeds: [embed] });
