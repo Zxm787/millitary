@@ -7784,23 +7784,21 @@ if (message.content.startsWith('!قصف')) {
                                 const defenderItems = await UserItem.find({ user_id: opponent.id });
                                 const hasAirDefense = defenderItems.some(item => item.item_name === 'نظام الدفاع الجوي');
                                 const airDefenseBullets = defenderItems.filter(item => item.item_name === 'رصاص دفاع جوي');
+                                const totalAirDefenseBullets = airDefenseBullets.reduce((total, item) => total + item.quantity, 0);
 
-                                if (hasAirDefense && airDefenseBullets.length >= quantity) {
-                                    // حذف رصاص الدفاع الجوي المستخدم
-                                    const airDefenseBulletsIds = airDefenseBullets.slice(0, quantity).map(item => item._id);
-                                    await UserItem.deleteMany({ _id: { $in: airDefenseBulletsIds } });
+                                if (hasAirDefense && totalAirDefenseBullets >= quantity) {
+                                    // خصم رصاص الدفاع الجوي المستخدم (الكمية المطلوبة فقط)
+                                    await removeUserItem(opponent.id, 'رصاص دفاع جوي', quantity);
 
-                                    // حذف الصواريخ المستخدمة
-                                    const usedMissiles = attackerMissiles.filter(item => item.item_name === selectedMissile).slice(0, quantity);
-                                    const usedMissilesIds = usedMissiles.map(item => item._id);
-                                    await UserItem.deleteMany({ _id: { $in: usedMissilesIds } });
+                                    // خصم الصواريخ المستخدمة
+                                    await removeUserItem(user.id, selectedMissile, quantity);
 
                                     const interceptEmbed = new discord.EmbedBuilder()
                                         .setColor('#00FF00')
                                         .setTitle('تم اعتراض الصواريخ!')
                                         .setDescription(`تم اعتراض ${quantity} من ${selectedMissile} بواسطة نظام الدفاع الجوي الخاص بـ ${opponent.username}.`)
                                         .addFields(
-                                            { name: 'رصاص دفاع جوي المتبقي:', value: `${airDefenseBullets.length - quantity}` },
+                                            { name: 'رصاص دفاع جوي المتبقي:', value: `${totalAirDefenseBullets - quantity}` },
                                             { name: 'الصواريخ المتبقية:', value: `${missileCounts[selectedMissile] - quantity}` }
                                         )
                                         .setFooter({ text: 'تم استهلاك رصاص دفاع جوي وصواريخ.' });
@@ -7857,10 +7855,8 @@ if (message.content.startsWith('!قصف')) {
                                         await UserItem.deleteOne({ user_id: opponent.id, item_name: 'أسوار' });
                                     }
 
-                                    // حذف الصواريخ المستخدمة
-                                    const usedMissiles = attackerMissiles.filter(item => item.item_name === selectedMissile).slice(0, quantity);
-                                    const usedMissilesIds = usedMissiles.map(item => item._id);
-                                    await UserItem.deleteMany({ _id: { $in: usedMissilesIds } });
+                                    // خصم الصواريخ المستخدمة
+                                    await removeUserItem(user.id, selectedMissile, quantity);
 
                                     const resultEmbed = new discord.EmbedBuilder()
                                         .setColor('#FF0000')
