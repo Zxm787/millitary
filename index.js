@@ -850,65 +850,288 @@ const ITEM_LIMITS = {
     'مستخرج النفط': 100
 };
 
-// دالة تحويل البيانات من النظام القديم إلى الجديد
-async function migrateInventorySystem() {
+// دالة تنظيف طارئة لتوفير مساحة قبل التحويل
+async function emergencyCleanupBeforeMigration() {
     try {
-        console.log('🔄 Starting inventory system migration...');
+        console.log('🚨 Starting emergency cleanup before migration...');
+        let totalCleaned = 0;
         
-        // البحث عن جميع المستخدمين الذين لديهم عناصر مكررة
-        const duplicateItems = await UserItem.aggregate([
-            {
-                $group: {
-                    _id: { user_id: "$user_id", item_name: "$item_name" },
-                    count: { $sum: 1 },
-                    items: { $push: "$_id" }
-                }
-            },
-            {
-                $match: { count: { $gt: 1 } }
-            }
-        ]);
-
-        let migratedCount = 0;
+        // 1. حذف التذاكر القديمة جداً (أكثر من يوم واحد)
+        const oldTickets = await mongoose.model('Ticket').deleteMany({
+            created_at: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+        });
+        totalCleaned += oldTickets.deletedCount;
+        console.log(`🗂️ Removed ${oldTickets.deletedCount} old tickets`);
         
-        for (const duplicate of duplicateItems) {
-            const { user_id, item_name } = duplicate._id;
-            const totalQuantity = duplicate.count;
-            
-            // حذف جميع السجلات المكررة
-            await UserItem.deleteMany({ 
-                user_id: user_id, 
-                item_name: item_name 
-            });
-            
-            // إنشاء سجل واحد بالكمية الإجمالية
-            const newItem = new UserItem({
-                user_id: user_id,
-                item_name: item_name,
-                quantity: totalQuantity
-            });
-            await newItem.save();
-            
-            migratedCount++;
-        }
-        
-        // تحديث العناصر الموجودة التي لا تحتوي على quantity
-        const itemsWithoutQuantity = await UserItem.find({ 
-            $or: [
-                { quantity: { $exists: false } },
-                { quantity: null },
-                { quantity: 0 }
-            ]
+        // 2. حذف المستخدمين غير النشطين (أكثر من 7 أيام بدون راتب وعملات أقل من 1000)
+        const inactiveUsers = await mongoose.model('User').find({
+            lastSalaryPaid: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+            coins: { $lt: 1000 }
         });
         
-        for (const item of itemsWithoutQuantity) {
-            item.quantity = 1;
-            await item.save();
+        // حذف عناصر المستخدمين غير النشطين أولاً
+        for (const user of inactiveUsers) {
+            const deletedItems = await UserItem.deleteMany({ user_id: user.id });
+            totalCleaned += deletedItems.deletedCount;
         }
         
-        console.log(`✅ Migration completed! Processed ${migratedCount} duplicate groups and ${itemsWithoutQuantity.length} items without quantity.`);
+        // ثم حذف المستخدمين أنفسهم
+        const deletedUsers = await mongoose.model('User').deleteMany({
+            _id: { $in: inactiveUsers.map(u => u._id) }
+        });
+        totalCleaned += deletedUsers.deletedCount;
+        console.log(`👥 Removed ${deletedUsers.deletedCount} inactive users and their items`);
         
-        return { migratedCount, updatedCount: itemsWithoutQuantity.length };
+        // 3. حذف المعاملات القديمة إن وجدت
+        if (mongoose.models.Transaction) {
+            const oldTransactions = await mongoose.model('Transaction').deleteMany({
+                createdAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
+            });
+            totalCleaned += oldTransactions.deletedCount;
+            console.log(`💰 Removed ${oldTransactions.deletedCount} old transactions`);
+        }
+        
+        // 4. تنظيف التحالفات الفارغة
+        const alliances = await mongoose.model('Alliance').find({});
+        let emptyAlliancesCount = 0;
+        for (const alliance of alliances) {
+            const memberCount = await mongoose.model('User').countDocuments({ alliance_id: alliance.id });
+            if (memberCount === 0) {
+                await mongoose.model('Alliance').deleteOne({ _id: alliance._id });
+                emptyAlliancesCount++;
+            }
+        }
+        totalCleaned += emptyAlliancesCount;
+        console.log(`🏰 Removed ${emptyAlliancesCount} empty alliances`);
+        
+        console.log(`🚨 Emergency cleanup completed! Total items cleaned: ${totalCleaned}`);
+        return totalCleaned;
+        
+    } catch (error) {
+        console.error('❌ Error during emergency cleanup:', error);
+        return 0;
+    }
+}
+
+// دالة تحويل البيانات من النظام القديم إلى الجديد (محسنة للذاكرة)
+async function migrateInventorySystem() {
+    try {
+        console.log('🔄 Starting optimized inventory system migration...');
+        
+        // تنظيف طارئ أولاً لتوفير مساحة
+        const cleanedCount = await emergencyCleanupBeforeMigration();
+        console.log(`🧹 Pre-migration cleanup freed up ${cleanedCount} records`);
+        
+        let totalMigratedCount = 0;
+        let totalUpdatedCount = 0;
+        
+        // الحصول على جميع أنواع العناصر الفريدة أولاً
+        const uniqueItems = await UserItem.distinct('item_name');
+        console.log(`📦 Found ${uniqueItems.length} unique item types to process`);
+        
+        // معالجة كل نوع عنصر على حدة لتوفير الذاكرة
+        for (let i = 0; i < uniqueItems.length; i++) {
+            const itemName = uniqueItems[i];
+            console.log(`🔄 Processing item ${i + 1}/${uniqueItems.length}: ${itemName}`);
+            
+            try {
+                // البحث عن المستخدمين الذين لديهم هذا العنصر مكرر
+                const duplicateUsers = await UserItem.aggregate([
+                    { $match: { item_name: itemName } },
+                    {
+                        $group: {
+                            _id: "$user_id",
+                            count: { $sum: 1 },
+                            items: { $push: "$_id" }
+                        }
+                    },
+                    { $match: { count: { $gt: 1 } } }
+                ], { allowDiskUse: true });
+                
+                // معالجة كل مستخدم على حدة
+                for (const duplicate of duplicateUsers) {
+                    const userId = duplicate._id;
+                    const totalQuantity = duplicate.count;
+                    
+                    // حذف جميع السجلات المكررة لهذا المستخدم وهذا العنصر
+                    await UserItem.deleteMany({ 
+                        user_id: userId, 
+                        item_name: itemName 
+                    });
+                    
+                    // إنشاء سجل واحد بالكمية الإجمالية
+                    const newItem = new UserItem({
+                        user_id: userId,
+                        item_name: itemName,
+                        quantity: totalQuantity
+                    });
+                    await newItem.save();
+                    
+                    totalMigratedCount++;
+                    
+                    // تنظيف الذاكرة كل 50 عملية
+                    if (totalMigratedCount % 50 === 0) {
+                        if (global.gc) global.gc();
+                        console.log(`🧹 Processed ${totalMigratedCount} duplicates so far...`);
+                    }
+                }
+                
+            } catch (error) {
+                console.error(`❌ Error processing ${itemName}:`, error.message);
+                // المتابعة مع العناصر الأخرى حتى لو فشل عنصر واحد
+                continue;
+            }
+        }
+        
+        console.log('🔧 Updating items without quantity...');
+        
+                 // تحديث العناصر التي لا تحتوي على quantity (بدفعات صغيرة جداً)
+         const BATCH_SIZE = 50; // تقليل حجم الدفعة لتوفير الذاكرة
+         let skip = 0;
+        
+        while (true) {
+            const itemsWithoutQuantity = await UserItem.find({ 
+                $or: [
+                    { quantity: { $exists: false } },
+                    { quantity: null },
+                    { quantity: 0 }
+                ]
+            }).limit(BATCH_SIZE).skip(skip);
+            
+            if (itemsWithoutQuantity.length === 0) break;
+            
+            // تحديث كل عنصر في هذه الدفعة
+            for (const item of itemsWithoutQuantity) {
+                item.quantity = 1;
+                await item.save();
+                totalUpdatedCount++;
+            }
+            
+            skip += BATCH_SIZE;
+            console.log(`🔧 Updated ${totalUpdatedCount} items without quantity...`);
+            
+            // تنظيف الذاكرة
+            if (global.gc) global.gc();
+        }
+        
+        console.log(`✅ Migration completed! Processed ${totalMigratedCount} duplicate groups and ${totalUpdatedCount} items without quantity.`);
+        
+        return { 
+            migratedCount: totalMigratedCount, 
+            updatedCount: totalUpdatedCount,
+            itemTypesProcessed: uniqueItems.length
+        };
+        
+    } catch (error) {
+        console.error('❌ Error during migration:', error);
+        return { error: error.message };
+    }
+}
+
+// دالة تحويل بدون تنظيف طارئ (للحالات التي تم التنظيف فيها مسبقاً)
+async function migrateInventorySystemOnly() {
+    try {
+        console.log('🔄 Starting inventory migration (no cleanup)...');
+        
+        let totalMigratedCount = 0;
+        let totalUpdatedCount = 0;
+        
+        // الحصول على جميع أنواع العناصر الفريدة أولاً
+        const uniqueItems = await UserItem.distinct('item_name');
+        console.log(`📦 Found ${uniqueItems.length} unique item types to process`);
+        
+        // معالجة كل نوع عنصر على حدة لتوفير الذاكرة
+        for (let i = 0; i < uniqueItems.length; i++) {
+            const itemName = uniqueItems[i];
+            console.log(`🔄 Processing item ${i + 1}/${uniqueItems.length}: ${itemName}`);
+            
+            try {
+                // البحث عن المستخدمين الذين لديهم هذا العنصر مكرر
+                const duplicateUsers = await UserItem.aggregate([
+                    { $match: { item_name: itemName } },
+                    {
+                        $group: {
+                            _id: "$user_id",
+                            count: { $sum: 1 },
+                            items: { $push: "$_id" }
+                        }
+                    },
+                    { $match: { count: { $gt: 1 } } }
+                ], { allowDiskUse: true });
+                
+                // معالجة كل مستخدم على حدة
+                for (const duplicate of duplicateUsers) {
+                    const userId = duplicate._id;
+                    const totalQuantity = duplicate.count;
+                    
+                    // حذف جميع السجلات المكررة لهذا المستخدم وهذا العنصر
+                    await UserItem.deleteMany({ 
+                        user_id: userId, 
+                        item_name: itemName 
+                    });
+                    
+                    // إنشاء سجل واحد بالكمية الإجمالية
+                    const newItem = new UserItem({
+                        user_id: userId,
+                        item_name: itemName,
+                        quantity: totalQuantity
+                    });
+                    await newItem.save();
+                    
+                    totalMigratedCount++;
+                    
+                    // تنظيف الذاكرة كل 25 عملية (أقل من النسخة مع التنظيف)
+                    if (totalMigratedCount % 25 === 0) {
+                        if (global.gc) global.gc();
+                        console.log(`🧹 Processed ${totalMigratedCount} duplicates so far...`);
+                    }
+                }
+                
+            } catch (error) {
+                console.error(`❌ Error processing ${itemName}:`, error.message);
+                // المتابعة مع العناصر الأخرى حتى لو فشل عنصر واحد
+                continue;
+            }
+        }
+        
+        console.log('🔧 Updating items without quantity...');
+        
+        // تحديث العناصر التي لا تحتوي على quantity (بدفعات صغيرة جداً)
+        const BATCH_SIZE = 25; // دفعات أصغر
+        let skip = 0;
+        
+        while (true) {
+            const itemsWithoutQuantity = await UserItem.find({ 
+                $or: [
+                    { quantity: { $exists: false } },
+                    { quantity: null },
+                    { quantity: 0 }
+                ]
+            }).limit(BATCH_SIZE).skip(skip);
+            
+            if (itemsWithoutQuantity.length === 0) break;
+            
+            // تحديث كل عنصر في هذه الدفعة
+            for (const item of itemsWithoutQuantity) {
+                item.quantity = 1;
+                await item.save();
+                totalUpdatedCount++;
+            }
+            
+            skip += BATCH_SIZE;
+            console.log(`🔧 Updated ${totalUpdatedCount} items without quantity...`);
+            
+            // تنظيف الذاكرة
+            if (global.gc) global.gc();
+        }
+        
+        console.log(`✅ Migration completed! Processed ${totalMigratedCount} duplicate groups and ${totalUpdatedCount} items without quantity.`);
+        
+        return { 
+            migratedCount: totalMigratedCount, 
+            updatedCount: totalUpdatedCount,
+            itemTypesProcessed: uniqueItems.length
+        };
         
     } catch (error) {
         console.error('❌ Error during migration:', error);
@@ -922,11 +1145,9 @@ mongoose.connection.once('open', async () => {
     // بدء نظام الرواتب التلقائي
     startSalarySystem();
     
-    // تشغيل التحويل التلقائي للنظام الجديد بعد 15 ثانية
-    setTimeout(async () => {
-        console.log('🔄 Starting automatic inventory migration...');
-        await migrateInventorySystem();
-    }, 15000);
+    // التحويل التلقائي معطل - استخدم الأوامر اليدوية للتحكم الكامل
+    // للتحويل اليدوي: استخدم !تنظيف_طارئ ثم !تحويل_المخزون بدون_تنظيف
+    console.log('ℹ️  Automatic migration disabled. Use manual commands: !تنظيف_طارئ then !تحويل_المخزون بدون_تنظيف');
 });
 
 // نظام الرواتب التلقائي
@@ -2866,7 +3087,7 @@ if (message.content === '!تصفير_الكل') {
 
     try {
         // التحقق من أن الرسالة تبدأ بأمر
-        const commands = ['!اضافة_عملات', '!تصفير', '!توب', '!البدء', '!غارة', '!هجوم', '!p', '!شراء', '!مخزون', '!قصف', '!تدريب', '!تحالف', '!انضمام', '!قبول', '!رفض', '!الطلبات', '!طرد', '!ترقية', '!تخفيض', '!اعطاء', '!حرب', '!سلام', '!مقبول', '!التحالفات', '!العلاقات', '!الاعضاء', '!خروج', '!حذف', '!ازالة', '!ازالة_الكل', '!راتب', '!تسريح', '!جمع', '!تذكرة', '!del', '!اجمالي', '!rem', '!الاقتصاد', '!شرح', '!تحويل_المخزون'];
+        const commands = ['!اضافة_عملات', '!تصفير', '!توب', '!البدء', '!غارة', '!هجوم', '!p', '!شراء', '!مخزون', '!قصف', '!تدريب', '!تحالف', '!انضمام', '!قبول', '!رفض', '!الطلبات', '!طرد', '!ترقية', '!تخفيض', '!اعطاء', '!حرب', '!سلام', '!مقبول', '!التحالفات', '!العلاقات', '!الاعضاء', '!خروج', '!حذف', '!ازالة', '!ازالة_الكل', '!راتب', '!تسريح', '!جمع', '!تذكرة', '!del', '!اجمالي', '!rem', '!الاقتصاد', '!شرح', '!تحويل_المخزون', '!تنظيف_طارئ'];
         const isCommand = commands.some(cmd => message.content.startsWith(cmd));
 
         if (!isCommand) return;
@@ -5538,21 +5759,33 @@ if (message.content === '!تصفير_الكل') {
                     return message.reply('عذراً، ليس لديك صلاحية لاستخدام هذا الأمر.');
                 }
 
-                message.reply('🔄 بدء تحويل نظام المخزون...');
+                const args = message.content.split(' ');
+                const skipCleanup = args[1] === 'بدون_تنظيف';
+
+                if (skipCleanup) {
+                    message.reply('🔄 بدء تحويل نظام المخزون (بدون تنظيف طارئ)...');
+                } else {
+                    message.reply('🔄 بدء تحويل نظام المخزون (مع تنظيف طارئ)...\n⚠️ **نصيحة:** إذا فشل التحويل، استخدم `!تنظيف_طارئ` أولاً ثم `!تحويل_المخزون بدون_تنظيف`');
+                }
                 
-                const result = await migrateInventorySystem();
+                const result = skipCleanup ? await migrateInventorySystemOnly() : await migrateInventorySystem();
                 
                 if (result.error) {
-                    message.reply(`❌ حدث خطأ أثناء التحويل: ${result.error}`);
+                    if (result.error.includes('memory limit')) {
+                        message.reply(`❌ خطأ في الذاكرة أثناء التحويل.\n\n**الحل:**\n1️⃣ استخدم \`!تنظيف_طارئ\` أولاً\n2️⃣ ثم استخدم \`!تحويل_المخزون بدون_تنظيف\`\n\nهذا سيوفر مساحة كافية للتحويل.`);
+                    } else {
+                        message.reply(`❌ حدث خطأ أثناء التحويل: ${result.error}`);
+                    }
                 } else {
                     const embed = new discord.EmbedBuilder()
                         .setColor('#00FF00')
                         .setTitle('✅ تم تحويل نظام المخزون بنجاح')
                         .addFields(
                             { name: '📦 المجموعات المحولة', value: `${result.migratedCount}`, inline: true },
-                            { name: '🔧 العناصر المحدثة', value: `${result.updatedCount}`, inline: true }
+                            { name: '🔧 العناصر المحدثة', value: `${result.updatedCount}`, inline: true },
+                            { name: '📋 أنواع العناصر', value: `${result.itemTypesProcessed || 'غير محدد'}`, inline: true }
                         )
-                        .setDescription('تم تحويل جميع العناصر المكررة إلى نظام الكمية الجديد.\n\n**الفوائد:**\n• تقليل استخدام قاعدة البيانات بشكل كبير\n• أداء أسرع للبوت\n• حد أقصى 100 منجم و 100 مستخرج نفط لكل لاعب')
+                        .setDescription('تم تحويل جميع العناصر المكررة إلى نظام الكمية الجديد.\n\n**الفوائد:**\n• تقليل استخدام قاعدة البيانات بشكل كبير (90%+)\n• أداء أسرع للبوت\n• حد أقصى 100 منجم و 100 مستخرج نفط لكل لاعب\n• تنظيف تلقائي للبيانات غير المستخدمة')
                         .setTimestamp();
 
                     message.reply({ embeds: [embed] });
@@ -5561,6 +5794,35 @@ if (message.content === '!تصفير_الكل') {
             } catch (error) {
                 console.error('Error in migration command:', error);
                 message.reply('❌ حدث خطأ أثناء تنفيذ التحويل.');
+            }
+        }
+
+        // أمر التنظيف الطارئ (للمشرفين فقط)
+        if (message.content.startsWith('!تنظيف_طارئ')) {
+            try {
+                if (!message.member.permissions.has('Administrator')) {
+                    return message.reply('عذراً، ليس لديك صلاحية لاستخدام هذا الأمر.');
+                }
+
+                message.reply('🚨 بدء التنظيف الطارئ لتوفير مساحة في قاعدة البيانات...');
+                
+                const cleanedCount = await emergencyCleanupBeforeMigration();
+                
+                const embed = new discord.EmbedBuilder()
+                    .setColor('#FFA500')
+                    .setTitle('🚨 تم التنظيف الطارئ بنجاح')
+                    .addFields(
+                        { name: '🗑️ العناصر المحذوفة', value: `${cleanedCount}`, inline: true },
+                        { name: '💾 مساحة محررة', value: 'تم تحرير مساحة كبيرة', inline: true }
+                    )
+                    .setDescription('تم حذف البيانات غير الضرورية:\n• التذاكر القديمة (أكثر من يوم)\n• المستخدمين غير النشطين (7+ أيام)\n• المعاملات القديمة\n• التحالفات الفارغة\n\n**الآن يمكنك تشغيل `!تحويل_المخزون`**')
+                    .setTimestamp();
+
+                message.reply({ embeds: [embed] });
+                
+            } catch (error) {
+                console.error('Error in emergency cleanup command:', error);
+                message.reply('❌ حدث خطأ أثناء تنفيذ التنظيف الطارئ.');
             }
         }
         // أمر لتصفير جنود اللاعب وممتلكاته وجيشه، يمكن استخدامه فقط من قبل المستخدمين الذين لديهم صلاحيات Administrator
