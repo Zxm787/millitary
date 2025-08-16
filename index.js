@@ -7791,7 +7791,7 @@ if (message.content.startsWith('!قصف')) {
                                     await removeUserItem(opponent.id, 'رصاص دفاع جوي', quantity);
 
                                     // خصم الصواريخ المستخدمة
-                                    await removeUserItem(user.id, selectedMissile, quantity);
+                                    await removeUserItem(message.author.id, selectedMissile, quantity);
 
                                     const interceptEmbed = new discord.EmbedBuilder()
                                         .setColor('#00FF00')
@@ -7825,9 +7825,13 @@ if (message.content.startsWith('!قصف')) {
                                     if (newSoldiers < 0) newSoldiers = 0;
 
                                     if (newSoldiers === 0) {
-                                        attacker.coins += opponentUser.coins;
                                         const totalCoinsWon = opponentUser.coins;
-                                        opponentUser.coins = 0;
+                                        
+                                        // تحديث عملات المهاجم
+                                        await User.updateOne({ id: message.author.id }, { $inc: { coins: totalCoinsWon } });
+                                        
+                                        // خصم الصواريخ المستخدمة
+                                        await removeUserItem(message.author.id, selectedMissile, quantity);
 
                                         const victoryEmbed = new discord.EmbedBuilder()
                                             .setColor('#FF0000')
@@ -7856,7 +7860,7 @@ if (message.content.startsWith('!قصف')) {
                                     }
 
                                     // خصم الصواريخ المستخدمة
-                                    await removeUserItem(user.id, selectedMissile, quantity);
+                                    await removeUserItem(message.author.id, selectedMissile, quantity);
 
                                     const resultEmbed = new discord.EmbedBuilder()
                                         .setColor('#FF0000')
